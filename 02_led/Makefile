@@ -6,7 +6,7 @@ KERNELDIR := /home/luoxl/rk3568/LinuxSDK/sdk/rk356x_linux_release_v1.3.1_2022112
 #指定当前路径 通过pwd来获得
 CURRENT_PATH := $(shell pwd)
 
-obj-m := leddev.o
+obj-m := leddev_rk3568.o
 
 # CP_PATH := /home/luoxl/linux/nfs/rootfs/lib/modules/4.1.15
 CP_PATH := /mnt/hgfs/share_dir_rk3568/app/dev_test
@@ -24,6 +24,7 @@ kernel_modules:
 #clean模块
 clean:
 	$(MAKE) -C $(KERNELDIR) M=$(CURRENT_PATH) clean
+	rm testapp
 
 app:
 	$(APPCC) testapp.c -o $(APP)

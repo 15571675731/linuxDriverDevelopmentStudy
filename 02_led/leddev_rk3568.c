@@ -7,10 +7,10 @@
 #include <asm/io.h>
 #include <asm/uaccess.h>
 
-#include "leddev.h"
+#include "leddev_rk3568.h"
 /////////////////////////////////////////////////
 //注意，使用此方法注册的驱动需要手动创建设备节点//
-//      sudo mknod /dev/myleddev c 234 0        //
+//      sudo mknod /dev/myleddev c 234 0       //
 /////////////////////////////////////////////////
 
 
@@ -206,6 +206,9 @@ static int __init myleddev_init(void)
     my_cdev.owner = THIS_MODULE;
     // 注册字符设备
     ret = cdev_add(&my_cdev, dev_num, 1);	
+
+	// 创建设备节点
+
 	// 注册字符设备驱动   设备号     设备名      文件操作结构体
 	if(ret < 0)
 	{

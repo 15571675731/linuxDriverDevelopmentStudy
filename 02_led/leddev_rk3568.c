@@ -9,8 +9,7 @@
 
 #include "leddev_rk3568.h"
 /////////////////////////////////////////////////
-//注意，使用此方法注册的驱动需要手动创建设备节点//
-//      sudo mknod /dev/myleddev c 234 0       //
+
 /////////////////////////////////////////////////
 
 
@@ -166,7 +165,6 @@ ssize_t myleddev_write(struct file *file, const char __user *buf, size_t len, lo
 	memcpy(kernel_buf, write_buf, strlen(write_buf));
 
     printk(KERN_INFO "mymyleddev: Wrote %d bytes\r\n", bytes_written);
-	// printk("w:%s\r\n", write_buf);
     return bytes_written;
 }
 

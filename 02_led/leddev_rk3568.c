@@ -15,11 +15,14 @@
 
 
 #define DEVICE_NAME			"myleddev"
+#define CLASS_NAME			"myleddev_class"
 
 #define BUFFER_SIZE			100
 
 static dev_t dev_num = 0;
 static struct cdev my_cdev;
+static struct class* my_class = NULL;
+static struct device *my_device = NULL;
 
 static char kernel_buf[10] = "off";
 static char write_buf[BUFFER_SIZE] = {0};
@@ -192,7 +195,7 @@ static int __init myleddev_init(void)
 
 	printk("my_chrdevbase_init\r\n"); //这里要用/r/n，不然会导致linux的命令界面卡住
 	
-	//动态分配设备号(会自动注册!)
+	// 1.动态分配设备号(会自动注册!)
 	ret = alloc_chrdev_region(&dev_num, 0, 1, DEVICE_NAME);
 	if(ret < 0){
 		printk(KERN_ERR "alloc_chrdev_region error!\r\n");
@@ -201,22 +204,37 @@ static int __init myleddev_init(void)
 		printk("%s init:major:%d, minor:%d\r\n", DEVICE_NAME, MAJOR(dev_num), MINOR(dev_num));
 	}
 
-	// 初始化 cdev 结构体
+	// 2.初始化 cdev 结构体
     cdev_init(&my_cdev, &fops);
     my_cdev.owner = THIS_MODULE;
     // 注册字符设备
     ret = cdev_add(&my_cdev, dev_num, 1);	
-
-	// 创建设备节点
-
-	// 注册字符设备驱动   设备号     设备名      文件操作结构体
-	if(ret < 0)
-	{
+	if(ret < 0){
 		/* 字符设备注册失败, 需要进行处理 */
 		unregister_chrdev_region(dev_num, 1); //如果注册失败，就先释放之前的设备
 		led_unmap();
-		printk("register_chrdev error, ret=%d!\r\n", ret); //打印错误信息
+		printk(KERN_ERR "Failed to add cdev\n"); //打印错误信息
 		return ret;
+	}
+
+	// 3.创建设备节点
+	// 3.1.创建class类
+	my_class = class_create(THIS_MODULE, CLASS_NAME);
+	if (IS_ERR(my_class)) {
+        cdev_del(&my_cdev);
+        unregister_chrdev_region(dev_num, 1);
+        printk(KERN_ERR "Failed to create class\n");
+        return PTR_ERR(my_class);
+    }
+
+	// 3.2.创建device类
+	my_device = device_create(my_class, NULL, dev_num, NULL, DEVICE_NAME);
+	if (IS_ERR(my_device)) {
+		class_destroy(my_class);
+		cdev_del(&my_cdev);
+        unregister_chrdev_region(dev_num, 1);
+        printk(KERN_ERR "Failed to create device\n");
+        return PTR_ERR(my_device);
 	}
 
 	return 0;
@@ -226,12 +244,19 @@ static int __init myleddev_init(void)
 static void __exit myleddev_exit(void)
 {
     printk("myleddev_exit\r\n");
+	/* 出口函数具体内容 */
+
+	//注销device类
+	device_destroy(my_class, dev_num);
+
+	//注销class类
+	class_destroy(my_class);
+
 	// 注销字符设备驱动
 	cdev_del(&my_cdev);
 
 	/* 注销设备号 */
 	unregister_chrdev_region(dev_num, 1);
-/* 出口函数具体内容 */
 }
 
 /* 将上面两个函数指定为驱动的入口和出口函数 */

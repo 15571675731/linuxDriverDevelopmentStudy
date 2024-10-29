@@ -76,7 +76,6 @@ int led_off(void)
 
 int myleddev_open(struct inode *inode, struct file *file)
 {
-	int i=0;
 	u32 val = 0;
 	printk("myleddev_open\r\n");
 
@@ -86,32 +85,27 @@ int myleddev_open(struct inode *inode, struct file *file)
 
 	// 1.IO复用
 	val = readl(V_GPIOC_0_MUX);
-	val |= (1<<16);
-	val |= (1<<17);
-	val |= (1<<18);
+	val &= ~(0x7<<16);
+	val |= (0x7<<16);
 	writel(val, V_GPIOC_0_MUX);
 
 	// 2.配置驱动能力
 	val = readl(V_GPIOC_0_DS);
-	for(i=0; i<=5; i++)
-	{
-		val |= (1<<i);
-	}
-	for(i=16; i<=21; i++)
-	{
-		val |= (1<<i);
-	}
+	val &= ~(0x3f<<0);
+	val |= (0x3f<<0);
+	val |= (0x3f<<16);//使能写
 	writel(val, V_GPIOC_0_DS);
 
 	// 3.配置输入输出方向
-	val |= (1<<1);
-	val |= (1<<16);
-	writel(0x10001, V_GPIOC_0_DDR);
+	val &= ~(0x1<<0);//貌似是因为这里写错了才导致灯不亮的，有机会试试
+	val |= (0x1<<0);
+	val |= (0x1<<16);
+	writel(val, V_GPIOC_0_DDR);
 
 	// 4.配置默认高低电平
-	val |= (1<<1);
-	val |= (1<<16);
-	writel(0x10001, V_GPIOC_0_DR);
+	val |= (0x1<<0);
+	val |= (0x1<<16);
+	writel(val, V_GPIOC_0_DR);
 
 	return 0;
 }

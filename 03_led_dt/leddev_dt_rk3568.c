@@ -23,7 +23,7 @@
 		compatible = "my-test-dt-led-rk3568";
 		pinctrl-names = "default";
 
-		gpios = <&gpio0 RK_PB0 GPIO_ACTIVE_LOW>;
+		gpios = <&gpio0 RK_PC0 GPIO_ACTIVE_LOW>;
 	};
 */
 /////////////////////////////////////////////////
@@ -60,6 +60,11 @@ int led_off(int gpio_num)
 	return 0;
 }
 
+int get_io_status(int gpio_num)
+{
+	return gpio_get_value(gpio_num);
+}
+
 int myleddev_open(struct inode *inode, struct file *file)
 {
 	printk("myleddev_open\r\n");
@@ -86,9 +91,16 @@ ssize_t myleddev_read(struct file *file, char __user *buf, size_t len, loff_t * 
 {
 	int bytes_read;
 	char read_buf[10] = "for test";
+	myled_t *leddev = file->private_data;
+	int gpio_val = 0;
+
+	gpio_val = get_io_status(leddev->led_gpio);
 
 	// 将数据拷贝到用户buf
-    bytes_read = copy_to_user(buf, read_buf, len);
+	if(len > 4){
+		len = 4;//最多拷贝四字节
+	}
+    bytes_read = copy_to_user(buf, &gpio_val, len);
 	if (bytes_read < 0) {
 		printk(KERN_ERR "copy_to_user failed!\r\n");
         return -EFAULT; // 返回错误

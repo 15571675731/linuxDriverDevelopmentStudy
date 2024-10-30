@@ -11,7 +11,7 @@
 int main(int argc, char **argv)
 {
     int fd = -1;
-    char read_buf[100] = {0};
+    int read_buf = 0;
     char write_buf[100] = {0};
 
     if(argc != 2)
@@ -32,8 +32,8 @@ int main(int argc, char **argv)
     close(fd);
     fd = open(DEV_NAME, O_RDWR);
     // lseek(fd, 0, SEEK_SET);
-    read(fd, read_buf, 10);
-    printf("read:%s\n", read_buf);
+    read(fd, &read_buf, 10);
+    printf("read:%d\n", read_buf);
 
     sleep(5);
     close(fd);

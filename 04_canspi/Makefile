@@ -12,10 +12,11 @@ obj-m := can_spi.o
 CP_PATH := /mnt/hgfs/share_dir_rk3568/app/dev_test
 
 APPCC := aarch64-linux-gnu-gcc -g
-APP := testapp
+APP := can_spi_testapp
 
 #默认 build 选择 kernel_modules
 build: kernel_modules app
+# build: kernel_modules
 
 #kernel_modules 模块
 kernel_modules:
@@ -24,7 +25,7 @@ kernel_modules:
 #clean模块
 clean:
 	$(MAKE) -C $(KERNELDIR) M=$(CURRENT_PATH) clean
-	rm testapp
+	rm $(APP)
 
 app:
 	$(APPCC) testapp.c -o $(APP)

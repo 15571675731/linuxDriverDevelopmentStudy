@@ -17,6 +17,7 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
+#include <linux/of_irq.h>
 #include <linux/uaccess.h>
 
 // spi通信使用的时钟频率
@@ -886,6 +887,8 @@ static int bjhk_ipcan_stop(struct net_device *net)
 
 	mutex_unlock(&priv->ipcan_lock);
 
+    dev_info(&spi->dev, "end bjhk_ipcan_stop\n");
+
 	return 0;
 }
 
@@ -993,6 +996,7 @@ static irqreturn_t bjhk_ipcan_interrupt_handler(int irq, void *dev_id)
     struct spi_device *spi = priv->spi; // spi的设备控制块
 	struct net_device *net = priv->net; // 网络设备控制块
 
+    // dev_info(&spi->dev, "CAN IRQ triggered: irq=%d\n", irq);
     // 加锁
 	mutex_lock(&priv->ipcan_lock);
 	// 只有CAN处于运行状态才进行下面的操作
@@ -1192,12 +1196,16 @@ static int bjhk_ipcan_open(struct net_device *net)
 
     // 申请中断
     // 直接使用设备树中spi->irq配置的中断  bjhk_ipcan_interrupt_handler:中断处理函数
+    dev_info(&spi->dev, "Registering IRQ %d...\n", spi->irq);
     ret = request_threaded_irq(spi->irq, NULL, bjhk_ipcan_interrupt_handler,
 				   flags, DEVICE_NAME, priv);
 	if (ret) {
 		dev_err(&spi->dev, "failed to acquire irq %d\n", spi->irq);
 		goto out_close;
-	}
+	} else {
+        dev_info(&spi->dev, "Successfully registered IRQ %d\n", spi->irq);
+    }
+    
 
     // 创建工作队列
     /* bjhk_ipcan_wq : 工作队列的名称,在调试时可以看到 */
@@ -1257,7 +1265,7 @@ static const struct net_device_ops bjhk_ipcan_netdev_ops = {
 // 设备树匹配表
 static const struct of_device_id bjhk_ipcan_of_match[] = {
 	{
-		.compatible	= "bjhk,ipcan",
+		.compatible	= "bjhk,ipcan-test",
 	},
     { }
 };
@@ -1283,6 +1291,7 @@ static int bjhk_ipcan_can_probe(struct spi_device *spi)
     struct bjhk_ipcan_priv *priv;
     int ret;
     int freq; // can的时钟配置
+    int irq = of_irq_get(spi->dev.of_node, 0);
 
     /* 通过设备树匹配表获取 CAN 设备类型 */
     match = of_match_device(bjhk_ipcan_of_match, &spi->dev);
@@ -1305,6 +1314,7 @@ static int bjhk_ipcan_can_probe(struct spi_device *spi)
     
     net->netdev_ops = &bjhk_ipcan_netdev_ops;
     net->flags |= IFF_ECHO;
+    net->irq = spi->irq;
 
     // 配置私有信息
 	priv = netdev_priv(net);
@@ -1321,7 +1331,7 @@ static int bjhk_ipcan_can_probe(struct spi_device *spi)
     // 告诉系统CAN的时钟配置
     priv->can.clock.freq = freq;
     // 只支持正常模式，不支持其他各种模式(不支持如 三采样、内部回环、监听模式等)
-    priv->can.ctrlmode_supported = 0;
+    priv->can.ctrlmode_supported = CAN_CTRLMODE_3_SAMPLES | CAN_CTRLMODE_LOOPBACK;
     // 配置用于错误计数器的函数
     priv->can.do_get_berr_counter = bjhk_ipcan_get_berr_counter;
     priv->net = net;
@@ -1340,6 +1350,12 @@ static int bjhk_ipcan_can_probe(struct spi_device *spi)
         ret = -EINVAL;
         goto error_probe;
     }
+    if (irq < 0) {
+        dev_err(&spi->dev, "Failed to get IRQ from DT: %d\n", irq);
+        return irq;
+    }
+    dev_info(&spi->dev, "IPCAN got irq = %d\n", irq);
+    spi->irq = irq;
 
     priv->spi = spi;
     // 初始化 SPI 互斥锁，防止多线程同时访问

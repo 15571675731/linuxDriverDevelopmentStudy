@@ -22,6 +22,7 @@
 #include <linux/irq.h>
 #include <linux/irqdomain.h>
 #include <linux/uaccess.h>
+#include <linux/ktime.h>
 
 // 中断IO
 #define IPCAN_GPIO_IRQ_NUM 92
@@ -265,6 +266,14 @@ struct bjhk_ipcan_priv {
 #define AFTER_SUSPEND_RESTART 8
 	// 用于记录是否开启错误重发功能
 	int restart_tx;
+
+    // 用于发送超时检测
+    struct delayed_work tx_timeout_work;
+#define TX_TIMEOUT_MS 100  // 超时等待 100ms
+
+    // 用于记录can接收数据包的数量
+    u64 rx_count;
+    ktime_t rx_start_time;
 };
 
 // 清理can发送队列
@@ -276,9 +285,10 @@ static void bjhk_ipcan_clean(struct net_device *net)
     if (priv->tx_skb || priv->tx_len)
         net->stats.tx_errors++;  // 记录 TX 失败次数
 
-    if (priv->tx_len){
+    if (priv->tx_skb || priv->tx_len){
         can_free_echo_skb(priv->net, 0);  // 释放 CAN 发送回显缓存
         priv->tx_skb = NULL;
+        netif_wake_queue(priv->net);  // 唤醒发送队列
     }
     priv->tx_len = 0;
 }
@@ -486,6 +496,12 @@ static void bjhk_ipcan_hw_tx(struct spi_device *spi, struct can_frame *frame)
 
     priv = spi_get_drvdata(spi);
 
+    if (priv->rx_count == 0) {
+        priv->rx_start_time = ktime_get();
+    }
+
+    priv->rx_count++;
+
     // 处理id的内容
     txfid = get_txfid_by_id(frame->can_id);
 
@@ -511,6 +527,15 @@ static void bjhk_ipcan_hw_tx(struct spi_device *spi, struct can_frame *frame)
 
 	// 将数据发送出去
     bjhk_ipcan_hw_tx_frame(spi, txfid, dlc, data1, data2);
+
+    if (priv->rx_count % 1000 == 0) {
+        ktime_t now = ktime_get();
+        s64 elapsed_ns = ktime_to_ns(ktime_sub(now, priv->rx_start_time));
+        dev_info(&priv->spi->dev,
+            "Received 1000 frames in %lld ns (%lld us)\n",
+            elapsed_ns, elapsed_ns / 1000);
+        priv->rx_start_time = now; // 重新计时
+    }
 }
 
 /*
@@ -553,6 +578,11 @@ static void bjhk_ipcan_hw_rx(struct spi_device *spi)
     int i= 0;
 
     priv = spi_get_drvdata(spi);
+
+    // if (priv->rx_count == 0) {
+    //     priv->rx_start_time = ktime_get();
+    // }
+    // priv->rx_count++;
 
 	// 申请缓冲区
 	skb = alloc_can_skb(priv->net, &frame);
@@ -609,6 +639,15 @@ static void bjhk_ipcan_hw_rx(struct spi_device *spi)
 
 	// 上报接收到的can数据给网络帧
 	netif_rx_ni(skb);
+
+    // if (priv->rx_count % 1000 == 0) {
+    //     ktime_t now = ktime_get();
+    //     s64 elapsed_ns = ktime_to_ns(ktime_sub(now, priv->rx_start_time));
+    //     dev_info(&priv->spi->dev,
+    //         "Received 1000 frames in %lld ns (%lld us)\n",
+    //         elapsed_ns, elapsed_ns / 1000);
+    //     priv->rx_start_time = now; // 重新计时
+    // }
 }
 
 /*
@@ -619,6 +658,37 @@ static void bjhk_ipcan_hw_sleep(struct spi_device *spi)
 	ipcan_write_register(spi, IPCAN_REG_FS, (1<<0));
 }
 
+
+/*
+发送超时检测
+*/
+static void bjhk_ipcan_tx_timeout_work_handler(struct work_struct *work)
+{
+    struct bjhk_ipcan_priv *priv = container_of(to_delayed_work(work), struct bjhk_ipcan_priv, tx_timeout_work);
+    // struct spi_device *spi = priv->spi;
+    struct net_device *net = priv->net;
+
+    // dev_warn(&spi->dev, "IPCAN: tx timeout detected, force cleanup\n");
+
+    mutex_lock(&priv->ipcan_lock);
+
+    // 统计错误
+    net->stats.tx_errors++;
+
+    // 清理未完成的 skb
+    can_free_echo_skb(net, 0);
+    priv->tx_skb = NULL;
+    priv->tx_len = 0;
+
+    // 重新唤醒队列防止死锁
+    netif_wake_queue(net);
+
+    mutex_unlock(&priv->ipcan_lock);
+    
+    // dev_info(&spi->dev, "IPCAN: tx timeout work handler finished\n");
+}
+
+
 /*
 发送入口函数
 */
@@ -628,6 +698,8 @@ static netdev_tx_t bjhk_ipcan_hard_start_xmit(struct sk_buff *skb,
     // struct can_frame *frame;
 	struct bjhk_ipcan_priv *priv = netdev_priv(net);
 	// struct spi_device *spi = priv->spi;
+
+    mutex_lock(&priv->ipcan_lock);
 
 	// 代表发送繁忙 防止覆盖未发送完成的数据
     if (priv->tx_skb || priv->tx_len) {
@@ -646,10 +718,11 @@ static netdev_tx_t bjhk_ipcan_hard_start_xmit(struct sk_buff *skb,
     // 将skb缓存到私有变量中
 	priv->tx_skb = skb;
     // 将发送任务加入tx工作队列
-	queue_work(priv->wq, &priv->tx_work);
-
+	queue_work(priv->wq, &priv->tx_work); // 表示已经接收该帧,稍后会一步发送数据(并不是发送成功)
+    // 超时检测
+    schedule_delayed_work(&priv->tx_timeout_work, msecs_to_jiffies(TX_TIMEOUT_MS));
+    
     // 如果还是有问题，可以不使用工作队列,直接发送spi，记得加锁
-    // mutex_lock(&priv->ipcan_lock);
     // frame = (struct can_frame *)priv->tx_skb->data;
 
     // if (frame->can_dlc > CAN_FRAME_MAX_DATA_LEN)
@@ -657,9 +730,10 @@ static netdev_tx_t bjhk_ipcan_hard_start_xmit(struct sk_buff *skb,
     // bjhk_ipcan_hw_tx(spi, frame);
     // priv->tx_len = 0;
     // priv->tx_skb = NULL;
-    // mutex_unlock(&priv->ipcan_lock);
 
-	// 表示已经接收该帧,稍后会一步发送数据(并不是发送成功)
+    mutex_unlock(&priv->ipcan_lock);
+
+    // dev_info(&priv->spi->dev, "IPCAN: Transmit success\n");
     return NETDEV_TX_OK;
 }
 
@@ -1056,11 +1130,12 @@ static irqreturn_t bjhk_ipcan_interrupt_handler(int irq, void *dev_id)
     int can_id = 0; // can_id:错误帧的标识ID  data1:错误帧的数据字段
     u8 data1 = 0;
     u32 t_intf = 0, t_ie=0;
-
+    struct can_frame *frame;
+    
     // 加锁
 	mutex_lock(&priv->ipcan_lock);
 	// 只有CAN处于运行状态才进行下面的操作
-    while (!priv->force_quit) {
+    if (!priv->force_quit) {
         /*
             new_state:用于表示can的状态 定义在 <linux/can/netlink.h>
                     一般有以下四个状态
@@ -1083,6 +1158,8 @@ static irqreturn_t bjhk_ipcan_interrupt_handler(int irq, void *dev_id)
 
         // 读取中断寄存器
         ipcan_read_register(spi, IPCAN_REG_IS, &intf);
+        // // 读完马上清除
+        // ipcan_write_register(spi, IPCAN_REG_IC, 0xfff);
         t_intf = intf;
         // 只保留这几个可以触发中断信号的标识
         intf &= (INT_TXFINISH | INT_RXFWRFULL | INT_RXFINISH | INT_ERROR | INT_BUSOFF);
@@ -1091,6 +1168,7 @@ static irqreturn_t bjhk_ipcan_interrupt_handler(int irq, void *dev_id)
         ipcan_read_register(spi, IPCAN_REG_ERRS, &eflag);
         // 读取错误计数器寄存器
         ipcan_read_register(spi, IPCAN_REG_ERRCNT, &err_count);
+        
 
         // 判断中断类型
         /* 如果是接收中断
@@ -1099,8 +1177,9 @@ static irqreturn_t bjhk_ipcan_interrupt_handler(int irq, void *dev_id)
             RXFRDEMPTY: 接收fifo读空中断
             INT_RXFWRFULL: 接收fifo写满中断
         */
-        // 接收完成中断
+        // 发送完成中断
         if (intf & INT_RXFINISH) {
+            // dev_info(&spi->dev, "IPCAN: Receive finished------------------------------\n");
             // 发送完成中断
             // 这里需要清除tx相关的中断标志位
             clear_intf |= (INT_RXFINISH);
@@ -1109,16 +1188,21 @@ static irqreturn_t bjhk_ipcan_interrupt_handler(int irq, void *dev_id)
         }
 
         // 发送完成中断处理
+        // dev_info(&spi->dev, "IPCAN: Transmit irq-------------------------\n");
         if (intf & INT_TXFINISH) {
-			net->stats.tx_packets++;
-			net->stats.tx_bytes += priv->tx_len - 1;
+            // dev_info(&spi->dev, "IPCAN: Transmit finished------------------------------\n");
+			
 			if (priv->tx_len) {
                 if (priv->tx_skb) {
+                    net->stats.tx_packets++;
+                    frame = (struct can_frame *)priv->tx_skb->data;
+			        net->stats.tx_bytes += frame->can_dlc;
                     can_get_echo_skb(net, 0);
                     priv->tx_skb = NULL;
                 } else {
                 }
 				priv->tx_len = 0;
+                cancel_delayed_work_sync(&priv->tx_timeout_work);
 			}
 			netif_wake_queue(net);
             intf &= ~(INT_TXFINISH); // 清除发送完成中断标志位
@@ -1195,6 +1279,7 @@ static irqreturn_t bjhk_ipcan_interrupt_handler(int irq, void *dev_id)
         // 处理溢出故障
         // 确认是否处于错误状态，是则发送错误包
         if(can_id && (intf&INT_ERROR)) {
+            dev_info(&spi->dev, "IPCAN: Error detected------------------------------\n");
             // 接收fifo溢出
             if(intf & INT_RXFWRFULL) {
                 net->stats.rx_over_errors++;
@@ -1202,6 +1287,8 @@ static irqreturn_t bjhk_ipcan_interrupt_handler(int irq, void *dev_id)
                 can_id |= CAN_ERR_CRTL;
                 data1 |= CAN_ERR_CRTL_RX_OVERFLOW;
                 intf &= ~(INT_RXFWRFULL); // 清除rx fifo溢出中断标志位
+                bjhk_ipcan_hw_reset(priv->spi);
+                bjhk_ipcan_do_set_bittiming(net);
             }
             // 这里只做了一个overflow的错误,其他的如ack错误、填充错误这些故障没有在这里上报
             bjhk_ipcan_error_skb(net, can_id, 1, &data1);
@@ -1218,28 +1305,6 @@ static irqreturn_t bjhk_ipcan_interrupt_handler(int irq, void *dev_id)
             intf &= ~(INT_ERROR); // 清除错误中断标志位
         }
 
-        // // 发送完成中断处理
-        // if (intf & INT_TXFINISH) {
-		// 	net->stats.tx_packets++;
-		// 	net->stats.tx_bytes += priv->tx_len - 1;
-		// 	if (priv->tx_len) {
-        //         if (priv->tx_skb) {
-        //             can_get_echo_skb(net, 0);
-        //             priv->tx_skb = NULL;
-        //         } else {
-        //             dev_warn(&spi->dev, "WARN: tx_len!=0 but tx_skb==NULL!\n");
-        //         }
-		// 		priv->tx_len = 0;
-		// 	}
-		// 	netif_wake_queue(net);
-        //     intf &= ~(INT_TXFINISH); // 清除发送完成中断标志位
-		// }
-
-        // // 清除中断标识位
-        // if (clear_intf) {
-            ipcan_write_register(spi, IPCAN_REG_IC, 0xfff);
-        // }
-
         // 如果总线关闭则判断是否字段恢复
         if (priv->can.state == CAN_STATE_BUS_OFF) {
 			if (priv->can.restart_ms == 0) {
@@ -1247,7 +1312,7 @@ static irqreturn_t bjhk_ipcan_interrupt_handler(int irq, void *dev_id)
 				priv->can.can_stats.bus_off++;
 				can_bus_off(net);
 				bjhk_ipcan_hw_sleep(spi);
-				break;
+				// break;
 			} else {
                 priv->restart_tx = 1;
                 priv->can.can_stats.bus_off++;
@@ -1257,10 +1322,13 @@ static irqreturn_t bjhk_ipcan_interrupt_handler(int irq, void *dev_id)
             }
 		}
 
-        if (intf == 0) {
-            break;
-        }
+        // if (intf == 0) {
+        //     break;
+        // }
     }
+
+    // 清除中断
+    ipcan_write_register(spi, IPCAN_REG_IC, 0xfff);
 
     mutex_unlock(&priv->ipcan_lock);
     return IRQ_HANDLED;
@@ -1274,7 +1342,7 @@ static int bjhk_ipcan_open(struct net_device *net)
     // 获取spi设备块
 	struct spi_device *spi = priv->spi;
     // 设置中断触发标识 一次性触发中断和下降沿触发中断
-	unsigned long flags = IRQF_ONESHOT | IRQF_TRIGGER_RISING;
+	unsigned long flags = IRQF_ONESHOT | IRQF_TRIGGER_RISING; // IRQF_TRIGGER_HIGH // IRQF_TRIGGER_RISING
     // 用于获取返回值
 	int ret = 0;
 
@@ -1303,7 +1371,6 @@ static int bjhk_ipcan_open(struct net_device *net)
 	} else {
         dev_info(&spi->dev, "Successfully registered IRQ %d\n", spi->irq);
     }
-    
 
     // 创建工作队列
     /* bjhk_ipcan_wq : 工作队列的名称,在调试时可以看到 */
@@ -1321,6 +1388,8 @@ static int bjhk_ipcan_open(struct net_device *net)
 	INIT_DELAYED_WORK(&priv->restart_work, bjhk_ipcan_restart_work_handler);
     // 错误帧队列
     INIT_WORK(&priv->err_work, bjhk_ipcan_error_work_handler);  // 新增错误处理
+    // 初始化 tx_timeout_work 工作任务
+    INIT_DELAYED_WORK(&priv->tx_timeout_work, bjhk_ipcan_tx_timeout_work_handler);
 
     // 复位IPCAN
 	ret = bjhk_ipcan_hw_reset(spi);
@@ -1427,9 +1496,10 @@ static int bjhk_ipcan_can_probe(struct spi_device *spi)
     net->flags |= IFF_ECHO;
     net->irq = irq;
 
-    
     // 配置私有信息
 	priv = netdev_priv(net);
+    // 初始化接收计数器
+    priv->rx_count = 0;
     // 自动重启时间
     priv->can.restart_ms = 0;
     // can的时序配置的取值范围
@@ -1456,7 +1526,7 @@ static int bjhk_ipcan_can_probe(struct spi_device *spi)
     /* -------------------配置SPI的相关内容-------------------*/
     /* 配置 SPI 模式、时钟等 */
     spi->mode = SPI_MODE_0; /* 具体模式取决于 IP 核 */
-    if (!spi->max_speed_hz) /* 首先使用设备树的设置，否则默认5MHz */
+    // if (!spi->max_speed_hz) /* 首先使用设备树的设置，否则默认5MHz */
         spi->max_speed_hz = IPCAN_SPI_FREQ;
     spi->bits_per_word = 16;
     if (spi_setup(spi)) {
@@ -1551,7 +1621,9 @@ static int bjhk_ipcan_remove(struct spi_device *spi)
 {
     struct bjhk_ipcan_priv *priv = spi_get_drvdata(spi);
 
-    cancel_work_sync(&priv->err_work);
+    dev_info(&spi->dev, "bjhk_ipcan_remove\n");
+
+    // cancel_work_sync(&priv->err_work);
 
     unregister_candev(priv->net);
     free_candev(priv->net);

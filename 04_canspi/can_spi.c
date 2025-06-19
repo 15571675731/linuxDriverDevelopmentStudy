@@ -230,6 +230,8 @@ struct bjhk_ipcan_priv {
 	struct workqueue_struct *wq;
 	// 用于处理can发送任务
 	struct work_struct tx_work;
+    // can接收队列
+	struct work_struct rx_work;
 	// 用于处理can复位或者重启任务,如总线关闭后的重启
 	struct delayed_work restart_work;
     // 异常处理队列
@@ -520,7 +522,6 @@ static void bjhk_ipcan_hw_tx_test(struct spi_device *spi, struct can_frame *fram
 
     check_data(frame);
 
-    // mutex_lock(&priv->ipcan_lock);
 
     if (priv->rx_count == 0) {
         priv->rx_start_time = ktime_get();
@@ -553,8 +554,6 @@ static void bjhk_ipcan_hw_tx_test(struct spi_device *spi, struct can_frame *fram
 
 	// 将数据发送出去
     bjhk_ipcan_hw_tx_frame(spi, txfid, dlc, data1, data2);
-
-    // mutex_unlock(&priv->ipcan_lock);
 
     if (priv->rx_count % 10000 == 0) {
         ktime_t now = ktime_get();
@@ -883,9 +882,9 @@ static int bjhk_ipcan_set_normal_mode(struct spi_device *spi)
         BUSOFF : busoff中断
     */
     ie_val |= INT_TXFINISH; // 发送完成
-    ie_val |= INT_RXFWRFULL; // 接收FIFO满
-    ie_val |= INT_RXFINISH; // 接收FIFO非空
-    ie_val |= INT_ERROR; // 错误中断
+    // ie_val |= INT_RXFWRFULL; // 接收FIFO满
+    ie_val |= INT_RXFINISH; // 接收完成 INT_RXFNEMPTY INT_RXFINISH
+    // ie_val |= INT_ERROR; // 错误中断
     ie_val |= INT_BUSOFF; // busoff中断
     // ie_val = 0xfff;
     // 写ie中断寄存器
@@ -1127,6 +1126,24 @@ static void bjhk_ipcan_error_skb(struct net_device *net, int can_id, int dlc, u8
 	}
 }
 
+
+/*
+接收工作队列服务函数
+*/
+static void bjhk_ipcan_rx_work_handler(struct work_struct *ws)
+{
+	struct bjhk_ipcan_priv *priv = container_of(ws, struct bjhk_ipcan_priv,
+						 rx_work);
+	struct spi_device *spi = priv->spi;
+    static int rxfull_count = 0;
+
+    rxfull_count++;
+    if (rxfull_count % 1000 == 0) {
+        dev_info(&spi->dev, "rxfull_count=%d\n", rxfull_count);
+    }
+	bjhk_ipcan_hw_rx(spi);
+}
+
 /*
 发送工作队列服务函数
 */
@@ -1243,6 +1260,8 @@ static irqreturn_t bjhk_ipcan_interrupt_handler(int irq, void *dev_id)
     // 加锁
 	mutex_lock(&priv->ipcan_lock);
     inter_count++;
+    // if (inter_count%1000 == 0)
+    // dev_info(&spi->dev, "IPCAN: Interrupt handler called, inter_count=%d\n", inter_count);
     
 	// 只有CAN处于运行状态才进行下面的操作
     if (!priv->force_quit) {
@@ -1280,11 +1299,11 @@ static irqreturn_t bjhk_ipcan_interrupt_handler(int irq, void *dev_id)
         // 读取错误计数器寄存器
         ipcan_read_register(spi, IPCAN_REG_ERRCNT, &err_count);
         
-        if (inter_count % 1000 == 0) {
-            dev_info(&spi->dev, "success_count_recv=%d,success_count=%d, inter_count=%d, xmit_count=%d, rxfull_count=%d", 
-                success_count_recv, success_count, inter_count, xmit_count, rxfull_count);
-            dev_info(&spi->dev, "t_intf=0x%x, intf=0x%x, t_ie=0x%x, eflag=0x%x, err_count=0x%x\n", t_intf, intf, t_ie, eflag, err_count);
-        }
+        // if (inter_count % 1000 == 0) {
+        //     dev_info(&spi->dev, "success_count_recv=%d,success_count=%d, inter_count=%d, xmit_count=%d, rxfull_count=%d", 
+        //         success_count_recv, success_count, inter_count, xmit_count, rxfull_count);
+        //     dev_info(&spi->dev, "t_intf=0x%x, intf=0x%x, t_ie=0x%x, eflag=0x%x, err_count=0x%x\n", t_intf, intf, t_ie, eflag, err_count);
+        // }
         // 判断中断类型
         /* 如果是接收中断
         与接收相关的中断有很多: 
@@ -1299,6 +1318,8 @@ static irqreturn_t bjhk_ipcan_interrupt_handler(int irq, void *dev_id)
             // 这里需要清除tx相关的中断标志位
             clear_intf |= (INT_RXFINISH);
             intf &= ~(INT_RXFINISH); // 清除tx相关中断标志位
+            // 启动接收工作队列服务函数
+            // queue_work(priv->wq, &priv->rx_work);
             bjhk_ipcan_hw_rx(spi);
         }
 
@@ -1572,7 +1593,7 @@ static int bjhk_ipcan_can_probe(struct spi_device *spi)
     int freq; // can的时钟配置
     int irq;
     // 设置中断触发标识 一次性触发中断和下降沿触发中断 IRQF_ONESHOT:只有当中断上下文都处理完后才再次使能中断(不设置就会出现一直触发上文而不执行下文的情况)
-	unsigned long flags = IRQF_ONESHOT | IRQF_TRIGGER_RISING; // IRQF_TRIGGER_HIGH // IRQF_TRIGGER_RISING
+	unsigned long flags = IRQF_TRIGGER_RISING; // IRQF_TRIGGER_HIGH // IRQF_TRIGGER_RISING  IRQF_ONESHOT
     
     // irq = of_irq_get(spi->dev.of_node, 0); // 使用spi irq会导致传输的数据异常 而且发送的很慢,手动申请GPIO IRQ就不会出现这种情况
     irq = gpio_to_irq(IPCAN_GPIO_IRQ_NUM);
@@ -1631,7 +1652,7 @@ static int bjhk_ipcan_can_probe(struct spi_device *spi)
 
     // 申请中断
     // bjhk_ipcan_interrupt_handler:中断处理函数(线程部分,上下文为NULL这个参数所指代的函数)
-    ret = request_threaded_irq(net->irq, NULL, bjhk_ipcan_interrupt_handler,
+    ret = request_threaded_irq(net->irq, bjhk_ipcan_interrupt_handler, NULL,
         flags, DEVICE_NAME, priv);
     if (ret) {
     dev_err(&spi->dev, "failed to acquire irq %d\n", net->irq);
@@ -1667,6 +1688,8 @@ static int bjhk_ipcan_can_probe(struct spi_device *spi)
 	}
     // 初始化 tx_work 工作任务
 	INIT_WORK(&priv->tx_work, bjhk_ipcan_tx_work_handler);
+    // 初始化 rx_work 工作任务
+	INIT_WORK(&priv->rx_work, bjhk_ipcan_rx_work_handler);
     // 初始化 restart_work 工作任务
 	INIT_DELAYED_WORK(&priv->restart_work, bjhk_ipcan_restart_work_handler);
     // 错误帧队列

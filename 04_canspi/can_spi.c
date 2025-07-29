@@ -112,6 +112,8 @@
 #define IPCAN_REG_TXHB_DATA1            0x1d
 // 发送高优先级缓存数据 2 寄存器
 #define IPCAN_REG_TXHB_DATA2            0x1e
+// 监听模式寄存器
+#define IPCAN_REG_LISTEN                0x20
 
 
 //一些寄存器值得定义
@@ -153,6 +155,11 @@
 #define CE_VAL_ENABLE_IPCAN             0x02
 // cmos通信状态为配置模式
 #define CMOS_VAL_CFG                    0x01
+// 打开监听模式(关闭tx)
+#define LISTEN_MODE                     0x22
+// 关闭监听模式(开启tx)
+#define NORMAL_MODE                     0x11
+
 
 // 写寄存器命令
 #define IPCAN_CMD_WRITE(addr, data_len)         (((1 << 14) | ((addr & 0x3F) << 8) | ((data_len&0x3f)<<2)))
@@ -767,7 +774,13 @@ static int bjhk_ipcan_set_normal_mode(struct spi_device *spi)
 	} else {
         if (priv->can.ctrlmode & CAN_CTRLMODE_LISTENONLY) {
             /* 硬件没有监听模式 */
-            dev_warn(&spi->dev, "Listen-only mode not supported on IPCAN\n");
+            dev_info(&spi->dev, "IPCAN set mode : listen mode\n");
+            init_buf[0] = LISTEN_MODE; // listen->listen
+            ipcan_write_register(spi, IPCAN_REG_LISTEN, init_buf, 1);
+        } else {
+            dev_info(&spi->dev, "IPCAN set mode : normal mode\n");
+            init_buf[0] = NORMAL_MODE; // listen->normal
+            ipcan_write_register(spi, IPCAN_REG_LISTEN, init_buf, 1);
         }
 		/* 设置为正常模式 */
         init_buf[0] = FS_VAL_NORMAL; // fs->normal
@@ -1433,7 +1446,7 @@ static int bjhk_ipcan_can_probe(struct spi_device *spi)
     // 告诉系统CAN的时钟配置
     priv->can.clock.freq = IPCAN_CAN_FREQ;
     // 只支持正常模式，不支持其他各种模式(不支持如 三采样、内部回环、监听模式等)
-    priv->can.ctrlmode_supported = CAN_CTRLMODE_3_SAMPLES | 
+    priv->can.ctrlmode_supported = CAN_CTRLMODE_3_SAMPLES | CAN_CTRLMODE_LISTENONLY |
         CAN_CTRLMODE_LOOPBACK | 
         CAN_CTRLMODE_BERR_REPORTING;
     priv->net = net;

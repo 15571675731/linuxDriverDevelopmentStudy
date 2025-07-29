@@ -24,6 +24,8 @@
 #include <linux/ktime.h>
 #include <linux/compiler.h>
 
+// #define DEBUG
+
 // 中断IO
 #define IPCAN_GPIO_IRQ_NUM 92
 
@@ -45,8 +47,6 @@
 #define DEVICE_NAME "bjhk_ipcan"
 
 #define BJHK_IPCAN_OST_DELAY_MS     (5)
-
-#define IPCAN_TEST                      0
 
 
 /* 定义IPUG132_CAN的寄存器 */
@@ -186,8 +186,6 @@
         将 ce.ce 置一
 */
 
-
-#define DEBUG
 
 
 static const struct can_bittiming_const bjhk_ipcan_bittiming_const = {
@@ -380,15 +378,20 @@ static int bjhk_ipcan_soft_reset(struct spi_device *spi)
 u32 int_count = 0; // 用于记录中断次数
 u32 int_return_count = 0; // 用于记录中断返回次数
 u32 test_flag = 0;
+#ifdef DEBUG    
 // 读取32寄存器(for test)
 static int ipcan_read_32_register(struct spi_device *spi)
 {
     u32 buf[5] = {0};
     ipcan_read_register(spi, 32, buf, 1);
     ipcan_read_register(spi, IPCAN_REG_IS, buf, 5);
+
     dev_info(&spi->dev, "IPCAN: Read is:0x%x, cmos:0x%x, err:0x%x, ect:0x%x\n", buf[0], buf[2], buf[3], buf[4]);
+
     return 0;
 }
+#endif
+
 /*
 读取错误寄存器中错误值
 */
@@ -408,11 +411,13 @@ static int bjhk_ipcan_get_berr_counter(const struct net_device *dev, struct can_
     bec->txerr = errcnt & 0xFF;        // 低 8 位是 TEC（发送错误计数）
     bec->rxerr = (errcnt >> 8) & 0xFF; // 高 8 位是 REC（接收错误计数）
 
+#ifdef DEBUG
     dev_info(&priv->spi->dev, "IPCAN: int_count=%d, int_return_count=%d\n", int_count, int_return_count);
     mutex_lock(&priv->ipcan_lock);
     ipcan_read_32_register(priv->spi);
     test_flag = 1;
     mutex_unlock(&priv->ipcan_lock);
+#endif
     
     return 0;
 }
@@ -1028,9 +1033,9 @@ static void bjhk_ipcan_restart_work_handler(struct work_struct *ws)
 						                    restart_work);
 	struct spi_device *spi = priv->spi;
 	struct net_device *net = priv->net;
-
+#ifdef DEBUG
     dev_info(&spi->dev, "IPCAN: Restarting IPCAN...\n");
-
+#endif
 	mutex_lock(&priv->ipcan_lock);
     priv->force_quit = 0;
     // 清空所有寄存器
@@ -1123,13 +1128,14 @@ static irqreturn_t bjhk_ipcan_interrupt_handler(int irq, void *dev_id)
         // 读取错误计数器寄存器
         err_count = rx_buf[4]; // IPCAN_REG_ERRCNT
         priv->err_count = err_count; // 更新错误计数器
+#ifdef DEBUG
         if (test_flag == 1) {
             test_flag = 0;
             dev_info(&spi->dev, "IPCAN: intf: 0x%x, eflag: 0x%x, err_count: 0x%x\n", intf, eflag, err_count);
         }
 
         int_count++;
-        
+#endif
         // 判断中断类型
         /* 如果是接收中断
         与接收相关的中断有很多: 
@@ -1206,7 +1212,9 @@ static irqreturn_t bjhk_ipcan_interrupt_handler(int irq, void *dev_id)
         // 处理溢出故障
         // 确认是否处于错误状态，是则发送错误包
         if(intf&INT_ERROR) {
+#ifdef DEBUG
             dev_info(&spi->dev, "IPCAN: Error detected------------------------------\n");
+#endif
             // 接收fifo溢出
             // if(intf & INT_RXFWRFULL) {
             //     net->stats.rx_over_errors++;
@@ -1259,7 +1267,10 @@ static irqreturn_t bjhk_ipcan_interrupt_handler(int irq, void *dev_id)
 
     mutex_unlock(&priv->ipcan_lock);
     // dev_info(&spi->dev, "IPCAN: Interrupt handler finished\n");
+#ifdef DEBUG
     int_return_count++;
+#endif // DEBUG
+
     return IRQ_HANDLED;
 }
 
@@ -1276,7 +1287,7 @@ static int bjhk_ipcan_open(struct net_device *net)
 	int ret = 0;
 
 // 用于测试
-#if IPCAN_TEST
+#ifdef DEBUG
     struct can_frame frame;
     int i=0;
 #endif
@@ -1569,9 +1580,9 @@ static int __maybe_unused bjhk_ipcan_resume(struct device *dev)
 
     spi = to_spi_device(dev);
     priv = spi_get_drvdata(spi);
-
+#ifdef DEBUG
     dev_info(&spi->dev, "bjhk_ipcan_resume: start\n");
-
+#endif
 	if (priv->after_suspend & AFTER_SUSPEND_UP) {
         /* 
          mcp251x的驱动中这里只唤醒电源，并不会唤醒spi寄存器
